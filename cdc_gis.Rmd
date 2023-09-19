@@ -30,9 +30,6 @@ poi <- rio::import("./data/processed/poi.xlsx") %>%
 # Información de ubigeos
 db_ubigeo <- readRDS("./data/geo/CDC_Ubigeo_22.rds")
 
-# Información de población
-db_pob <- rio::import("./data/geo/CDC_Poblacion_2023.xlsx")
-
 # Información riesgos
 db_riesgo <- rio::import("./data/processed/riesgo.xlsx")
 ```
