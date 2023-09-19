@@ -1,0 +1,346 @@
+---
+title: "ANÁLISIS ESPACIAL EN EPIDEMIOLOGÍA: VISUALIZACIÓN DE MAPAS COROPLÉTICOS"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+
+knitr::opts_chunk$set(
+    echo = FALSE,
+    warning = FALSE
+)
+
+# LIBRERIAS ----
+library(glue)
+library(sf)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Información vectorial - Polígonos
+shp_depa <- st_read("./data/geo/CDC_Departamentos.shp")
+shp_prov <- st_read("./data/geo/CDC_Provincias.shp")
+shp_dist <- st_read("./data/geo/CDC_Distritos.shp")
+
+# Información vectorial - Puntos
+poi <- rio::import("./data/processed/poi.xlsx") %>%
+    filter(!is.na(ubigeo))
+
+# Información de ubigeos
+db_ubigeo <- readRDS("./data/geo/CDC_Ubigeo_22.rds")
+
+# Información de población
+db_pob <- rio::import("./data/geo/CDC_Poblacion_2023.xlsx")
+
+# Información riesgos
+db_riesgo <- rio::import("./data/processed/riesgo.xlsx")
+```
+
+# Exploración de información vectorial
+
+Los objetos `simple feature` poseen una seríe de métodos relacionados a las clase `sf`.
+
+```{r sf}
+# Clase de data vectorial
+class(shp_depa)
+str(shp_depa)
+
+# Atributos
+st_geometry(shp_depa)
+st_crs(shp_depa)
+attributes(st_geometry(shp_depa))
+
+plot(shp_depa)
+```
+
+Cuando convertimos un objeto `sf` a un `data.frame` se pierden estos métodos, y pueden causar errores a la hora de querer representar la data vectorial en mapas.
+
+```{r df}
+# Convertir a data frame
+df_depa <- as.data.frame(shp_depa)
+class(df_depa)
+str(df_depa)
+
+# NOTE: se pierde la clase de 'sf' y los métodos relacionados
+try(st_geometry(df_depa))
+try(plot(df_depa))
+```
+
+# Re-Proyección del sistema de referencia
+
+Cuando tengamos información de diferentes sistemas de referencia, es importante conocer la forma de transformar la información para facilitar el procesamiento espacial.
+
+```{r proyeccion}
+# Proyectar a UTM zona 18S segun codigo EPSG
+# NOTE: Perú cuenta con 3 husos: 17, 18 y 19
+# Códigos EPSG son: 32717, 32718 y 32719
+shp_depa_utm <- shp_depa %>% st_transform(crs = 32718)
+
+# Nuevos atributos
+class(shp_depa_utm)
+str(shp_depa_utm)
+st_geometry(shp_depa_utm)
+st_crs(shp_depa_utm)
+
+```
+
+Se recomienda utilizar el CRS UTM para realizar cálculos, ya que las unidades utilizadas son metros.
+
+```{r area}
+# Calcular área
+shp_depa_utm %>% mutate(area = st_area(shp_depa_utm))
+```
+
+# Importación de puntos de interés (coordenadas geográficas)
+
+A diferencia de la información vectorial de tipo polígono, los puntos se pueden trabajar directamente desde una archivo de datos, no es necesario contar con un `shapefile` de puntos de interés (poi).
+
+```{r poi_exploracion}
+# Exploración de información
+glimpse(poi)
+class(poi)
+```
+
+```{r poi_sf}
+# Tranformación a sf (data vectorial)
+poi_vectorial <- poi %>%
+    filter(!is.na(lat)) %>%
+    st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+st_coordinates(poi_vectorial) %>% head()
+
+# Extracción de información espacial de un objeto sf
+poi_vectorial %>%
+    mutate(
+        lon = st_coordinates(.)[, 1],
+        lat = st_coordinates(.)[, 2]
+    )
+```
+
+```{r poi_proyeccion}
+poi_vectorial_utm <- poi_vectorial %>%
+    # Re-Proyección a UTM
+    st_transform(crs = 32718) %>%
+    # Rescatar información de coordenadas UTM
+    mutate(
+        este = st_coordinates(.)[, 1],
+        norte = st_coordinates(.)[, 2]
+    )
+poi_vectorial_utm
+```
+
+Si queremos exportar la información proceada, es importante tener en cuenta que un objeto `sf` almacena como lista la información de la `geometry`.
+
+```{r poi_export}
+# Exportar información
+try(rio::export(poi_vectorial_utm, "./output/poi.xlsx"))
+str(poi_vectorial_utm$geometry)
+class(poi_vectorial_utm)
+
+# Retirar información de geometría
+poi_vectorial_utm %>%
+    st_set_geometry(NULL) %>%
+    rio::export("./output/poi.xlsx")
+```
+
+# Mapas coropléticos
+
+## Mapa de casos acumulados por departamento
+
+Procesamiento de observaciones acumuladas según escala espacial de interés (departamento, provincia, o distrito).
+
+> Se recomienda tener archivos vectoriales (`shapefiles`) para cada nivel político administraivo: departamento, provincia, distrito.
+
+```{r mp_proceso_1}
+# Generar base de casos semanales
+db_casos <- poi %>%
+    filter(ano == 2022) %>%
+    count(ubigeo, ano, semepi)
+
+# Mapa coroplético de casos por departamento
+db_mapa_depa <- db_casos %>%
+    left_join(db_ubigeo, by = "ubigeo") %>%
+    group_by(departamento) %>%
+    summarise(total_casos = sum(n), .groups = "drop")
+db_mapa_depa %>% head()
+```
+
+```{r map_1}
+# Opción 1
+db_mapa_depa %>%
+    left_join(shp_depa, by = c("departamento" = "departamen")) %>%
+    ggplot() +
+    geom_sf(aes(fill = total_casos, geometry = geometry))
+```
+
+> Importante saber el tipo de clase de objeto que se va a utilizar para generar el mapa. `geom_sf` solo funcion con objetos `sf`, tanto para polígonos como para puntos.
+
+```{r map_2}
+# Opción 2
+op2 <- shp_depa %>%
+    left_join(db_mapa_depa, by = c("departamen" = "departamento")) %>%
+    # mutate(total_casos = if_else(is.na(total_casos), 0, total_casos)) %>%
+    ggplot() +
+    geom_sf(aes(fill = total_casos))
+op2
+```
+
+## Mapa casos semanales por distrito
+
+Podemos generar mapas coropléticos para mostrar series de tiempo, para estoy hay que tener algunas consideraciones importantes a la hora de graficar la información.
+
+```{r mp_proceso_2}
+# Información de distrito de Lima Metropolitana
+db_ubigeo_lima <- db_ubigeo %>%
+    filter(departamento == "LIMA", provincia == "LIMA") %>%
+    pull(ubigeo)
+
+# Base de casos semanales
+db_lag <- db_casos %>%
+    filter(ubigeo %in% db_ubigeo_lima) %>%
+    group_by(ubigeo, semepi) %>%
+    summarise(total_casos = sum(n), .groups = "drop") %>%
+    complete(
+        ubigeo = db_ubigeo_lima, semepi,
+        fill = list(total_casos = 0)
+    )
+db_lag
+```
+
+```{r shp_1}
+# Información vectorial de distritos de Lima Metropolitana
+shp_dist_lima <- shp_dist %>%
+    filter(departamen == "LIMA", provincia == "LIMA")
+```
+
+```{r map_3}
+# Mapa coroplético semanal
+shp_dist_lima %>%
+    left_join(db_lag, by = "ubigeo") %>%
+    ggplot() +
+    geom_sf(aes(fill = total_casos)) +
+    scale_fill_viridis_c() +
+    facet_wrap(~semepi, nrow = 4)
+```
+
+## Mapa de riesgo con variables categóricas
+
+Los mapas coropléticos pueden mostrar variables categóricas y continuas. Es importante conocer nuesta información para poder identificar estar variables y cómo generarlas para su mejorar visualización.
+
+```{r mp_proceso_3}
+# Zona de estudio
+zona_interes <- "PIURA"
+
+# Preparar información nacional
+db_clasificacion <- db_riesgo %>%
+    mutate(
+        clasificacion = case_when(
+            puntaje_total <= 34 ~ "Riesgo bajo",
+            puntaje_total <= 48 ~ "Riesgo medio",
+            puntaje_total <= 60 ~ "Riesgo alto",
+            puntaje_total > 60 ~ "Riesgo muy alto"
+        ),
+        clasificacion = forcats::fct_relevel(
+            clasificacion,
+            "Riesgo bajo",
+            "Riesgo medio",
+            "Riesgo alto",
+            "Riesgo muy alto"
+        )
+    )
+
+# Información de zona de interés
+db_riesgo_interes <- db_clasificacion %>%
+    filter(departamento == zona_interes)
+db_riesgo_interes
+```
+
+```{r shp_2}
+# Información vectorial
+shp_interes <- shp_dist %>%
+    filter(departamen == zona_interes) %>%
+    select(ubigeo)
+shp_interes_prov <- shp_prov %>%
+    filter(departamen == zona_interes)
+```
+
+```{r map_4}
+# Mapa coroplético
+shp_interes %>%
+    left_join(db_riesgo_interes, by = "ubigeo") %>%
+    ggplot() +
+    geom_sf(aes(fill = clasificacion)) +
+    scale_fill_manual(values = c("#57E799", "#FEF25D", "#E74C3C", "#B13000")) +
+    geom_sf(data = shp_interes_prov, linewidth = 1, color = "black", fill = NA) +
+    labs(
+        title = glue("Mapa de riesgo municipal del departamento de {zona_interes}"),
+        x = "Longitud",
+        y = "Latitud",
+        fill = "Categoría"
+    ) +
+    theme_bw()
+```
+
+```{r map_export}
+# Guardar mapa coroplético
+ggsave(
+    plot = last_plot(),
+    filename = "mapa_riesgo_test.png",
+    path = "./output/",
+    width = 10,
+    height = 7
+)
+```
+
+## ¿Por qué hacerlo con R?
+
+> AUTOMATIZACIÓN
+
+```{r automatización}
+# Función de generación de mapas
+generar_mapas <- function(depa) {
+    # Preparar información
+    db <- db_clasificacion %>%
+        filter(departamento == depa)
+
+    # Información vectorial
+    s_dist <- shp_dist %>%
+        filter(departamen == depa) %>%
+        select(ubigeo)
+    s_prov <- shp_prov %>%
+        filter(departamen == depa)
+
+    # Mapa coroplético
+    mapa <- s_dist %>%
+        left_join(db, by = "ubigeo") %>%
+        ggplot() +
+        geom_sf(aes(fill = clasificacion)) +
+        scale_fill_manual(values = c("#57E799", "#FEF25D", "#E74C3C", "#B13000")) +
+        geom_sf(data = s_prov, linewidth = 1, color = "black", fill = NA) +
+        labs(
+            title = glue("Mapa de riesgo municipal"),
+            subtitle = glue("Deparatmento: {stringr::str_to_sentence(depa)}"),
+            x = "Longitud",
+            y = "Latitud",
+            fill = "Categoría"
+        ) +
+        theme_bw()
+    
+    # Guardar mapa coroplético
+    ggsave(
+        plot = mapa,
+        filename = glue("mapa_riesgo_{depa}.png"),
+        path = "./output/",
+        width = 10,
+        height = 7
+    )
+}
+
+lista_depa <- unique(db_riesgo$departamento)
+
+# Generar mapas
+for (depa in lista_depa) {
+    generar_mapas(depa)
+}
+```
